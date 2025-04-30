@@ -1,0 +1,10 @@
+# Node modules and logs
+node_modules/
+*.log
+
+# Sensitive files
+.env
+db.js
+
+# Don't track uploaded images
+images/
