@@ -11,10 +11,10 @@ app.use(express.json());
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
 // serve images statically
-app.use('/images', express.static(path.join(__dirname, 'images')));
+const imageDir = path.join(__dirname, 'images');
+app.use('/images', express.static(imageDir));
 // mount your employee router under /api/employees
-app.use('/api/employees', require('./employees'));
-
+app.use('/api', require('./employees'));
 /**
  * SUPERUSER LOGIN - Authenticate via password, return company info
  */
@@ -53,6 +53,74 @@ app.post('/api/superuser/login', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+app.post('/api/attendance/last-record', async (req, res) => {
+  const { employeeNumber, deviceUUID } = req.body;
+
+  if (!employeeNumber || !deviceUUID) {
+    return res.status(400).json({ success: false, error: 'employeeNumber and deviceUUID are required' });
+  }
+
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+
+    // 1️⃣ Lookup device info
+    const [[device]] = await sequelize.query(`
+      SELECT id AS deviceId, companyId, outletId
+      FROM Devices
+      WHERE deviceUUID = :deviceUUID
+    `, { replacements: { deviceUUID } });
+
+    if (!device) {
+      return res.status(404).json({ success: false, error: 'Device not found' });
+    }
+
+    // 2️⃣ Lookup employee ID
+    const [[emp]] = await sequelize.query(`
+      SELECT id
+      FROM Employees
+      WHERE employeeNumber = :employeeNumber AND companyId = :companyId
+    `, { replacements: { employeeNumber, companyId: device.companyId } });
+
+    if (!emp) {
+      return res.status(404).json({ success: false, error: 'Employee not found' });
+    }
+
+    // 3️⃣ Get latest TimeRecord for today
+    const [records] = await sequelize.query(`
+      SELECT TOP 1
+        id, clockInTime, clockOutTime,
+        breakStartTime, breakEndTime,
+        break2StartTime, break2EndTime,
+        break3StartTime, break3EndTime
+      FROM TimeRecords
+      WHERE employeeId = :employeeId
+        AND deviceId = :deviceId
+        AND outletId = :outletId
+        AND companyId = :companyId
+        AND [date] = :today
+      ORDER BY updatedAt DESC
+    `, {
+      replacements: {
+        employeeId: emp.id,
+        deviceId: device.deviceId,
+        outletId: device.outletId,
+        companyId: device.companyId,
+        today
+      }
+    });
+
+    if (!records.length) {
+      return res.json({ success: true, record: null });
+    }
+
+    return res.json({ success: true, record: records[0] });
+
+  } catch (err) {
+    console.error('❌ Error fetching last time record:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 /**
  * Validate users - Authenticate via pin
  */
@@ -115,8 +183,6 @@ app.post('/api/employee/validate', async (req, res) => {
 /**
  * Clock in
  */
-// index.js
-// index.js
 app.post('/api/attendance/record', async (req, res) => {
   let { employeeNumber, action, deviceUUID } = req.body;
   if (!employeeNumber || !action || !deviceUUID) {
@@ -173,7 +239,7 @@ app.post('/api/attendance/record', async (req, res) => {
            clockInTime, clockInNote, createdAt, updatedAt, updatedBy)
         VALUES
           (:employeeId, :deviceId, :outletId, :companyId, 'pin', :today,
-           GETDATE(), 'Started shift', GETDATE(), GETDATE(), 0)
+           GETDATE(), '', GETDATE(), GETDATE(), 0)
       `, { replacements:{ employeeId, deviceId, outletId, companyId, today }});
 
       return res.json({ success:true, message:'Clock-in recorded' });
@@ -202,7 +268,7 @@ app.post('/api/attendance/record', async (req, res) => {
       await sequelize.query(`
         UPDATE TimeRecords
            SET clockOutTime = GETDATE(),
-               clockOutNote = 'End of shift',
+               clockOutNote = '',
                updatedAt    = GETDATE()
          WHERE employeeId   = :employeeId
            AND deviceId     = :deviceId
@@ -238,15 +304,15 @@ app.post('/api/attendance/record', async (req, res) => {
 
       // figure out which break slot to use
       let fieldStart = '', fieldEnd = '', noteStart = '', noteEnd = '';
-      if      (!rec.breakStartTime)           { fieldStart = 'breakStartTime';  noteStart = 'Lunch';         }
+      if      (!rec.breakStartTime)           { fieldStart = 'breakStartTime';  noteStart = '';         }
       else if (!rec.breakEndTime && action==='break_stop')
-                                              { fieldEnd   = 'breakEndTime';    noteEnd   = 'Back from lunch';}
-      else if (!rec.break2StartTime)          { fieldStart = 'break2StartTime'; noteStart = 'Coffee break';   }
+                                              { fieldEnd   = 'breakEndTime';    noteEnd   = '';}
+      else if (!rec.break2StartTime)          { fieldStart = 'break2StartTime'; noteStart = '';   }
       else if (!rec.break2EndTime && action==='break_stop')
-                                              { fieldEnd   = 'break2EndTime';   noteEnd   = 'Back to work';    }
-      else if (!rec.break3StartTime)          { fieldStart = 'break3StartTime'; noteStart = 'Short break';    }
+                                              { fieldEnd   = 'break2EndTime';   noteEnd   = '';    }
+      else if (!rec.break3StartTime)          { fieldStart = 'break3StartTime'; noteStart = '';    }
       else if (!rec.break3EndTime && action==='break_stop')
-                                              { fieldEnd   = 'break3EndTime';   noteEnd   = 'Wrap-up';         }
+                                              { fieldEnd   = 'break3EndTime';   noteEnd   = '';         }
       else {
         return res.status(400).json({ success:false, error:'No available break slots' });
       }
@@ -585,89 +651,36 @@ app.get('/api/debug/schema', async (req, res) => {
   }
 });
 
+// GET /api/device/pin-required
+app.post('/api/device/pin-required', async (req, res) => {
+  const { deviceUUID, deviceId } = req.body;
 
-const fs = require('fs');
-const path = require('path');
-const multer = require('multer');
+  try {
+    const query = `
+      SELECT pinRequired FROM Devices
+      WHERE ${deviceUUID ? 'deviceUUID = @deviceUUID' : 'id = @deviceId'}
+    `;
 
-// Define storage path
-const IMAGE_FOLDER = 'D:/Nodejs/Employees_CheckIn_API/Images';
+    const request = new sql.Request();
+    if (deviceUUID) request.input('deviceUUID', sql.VarChar, deviceUUID);
+    if (deviceId) request.input('deviceId', sql.Int, deviceId);
 
-// Ensure folder exists
-if (!fs.existsSync(IMAGE_FOLDER)) {
-    fs.mkdirSync(IMAGE_FOLDER, { recursive: true });
-}
-app.use('/images', express.static(IMAGE_FOLDER));
+    const result = await request.query(query);
+    if (result.recordset.length === 0) {
+      return res.status(404).json({ success: false, error: 'Device not found' });
+    }
 
-// Mount our employees router
-app.use('/api/employees', employeesRouter);
-// Configure Multer
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-      cb(null, IMAGE_FOLDER);
-  },
-  filename: (req, file, cb) => {
-      cb(null, file.originalname);  // Temp name, will rename later
+    res.json({ success: true, pinRequired: result.recordset[0].pinRequired });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
-
-const upload = multer({ storage });
-
-/**
- * UPLOAD EMPLOYEE PHOTO
- */
-app.post('/api/employees/:id/photos', upload.array('photos', 10), (req, res) => {
-  const employeeId = req.params.id;
-
-  req.files.forEach((file, index) => {
-      const ext = path.extname(file.originalname);
-      const targetPath = path.join(IMAGE_FOLDER, `employee_${employeeId}_${index + 1}${ext}`);
-      fs.renameSync(file.path, targetPath);
-  });
-
-  res.json({ success: true, message: 'Photos uploaded successfully!' });
-});
-
-
-/**
- * GET EMPLOYEE PHOTOS
- */
-app.get('/api/employees/:id/photos', (req, res) => {
-  const employeeId = req.params.id;
-  const files = fs.readdirSync(IMAGE_FOLDER);
-
-  const photoFiles = files.filter(file => file.startsWith(`employee_${employeeId}_`));
-
-  if (photoFiles.length === 0) {
-      return res.status(404).json({ error: 'No photos found for this employee' });
-  }
-
-  const photoUrls = photoFiles.map(file => 
-      `http://localhost:${PORT}/api/employees/${employeeId}/photo/${file}`
-  );
-
-  res.json({ success: true, photos: photoUrls });
-});
-
-/**
- * GET EMPLOYEE ONE PHOTO
- */
-app.get('/api/employees/:id/photo/:filename', (req, res) => {
-  const { filename } = req.params;
-  const imagePath = path.join(IMAGE_FOLDER, filename);
-
-  if (fs.existsSync(imagePath)) {
-      res.sendFile(imagePath);
-  } else {
-      res.status(404).json({ error: 'Photo not found' });
-  }
-});
-
 
 /**
  * Start server
  */
 const PORT = 3012;
-app.listen(PORT, () => {
-  console.log(`🚀 API server running at http://localhost:${PORT}`);
+app.listen(process.env.PORT, () => {
+  console.log(`🚀 API server running at http://localhost:${process.env.PORT}`);
 });
