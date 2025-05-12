@@ -6,8 +6,11 @@ const app = express();
 const employeesRouter = require('./employees');
 const path    = require('path');
 const cors = require('cors');
+const { uploadFaceImage } = require('./face_employee');
+const axios = require("axios");
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
 // serve images statically
@@ -15,6 +18,10 @@ const imageDir = path.join(__dirname, 'images');
 app.use('/images', express.static(imageDir));
 // mount your employee router under /api/employees
 app.use('/api', require('./employees'));
+app.post('/api/face/upload', uploadFaceImage);
+const faceSyncRoutes = require("./faceSync");
+app.use("/api/face", faceSyncRoutes);
+
 /**
  * SUPERUSER LOGIN - Authenticate via password, return company info
  */
@@ -656,26 +663,78 @@ app.post('/api/device/pin-required', async (req, res) => {
   const { deviceUUID, deviceId } = req.body;
 
   try {
-    const query = `
-      SELECT pinRequired FROM Devices
-      WHERE ${deviceUUID ? 'deviceUUID = @deviceUUID' : 'id = @deviceId'}
-    `;
+    let query = '';
+    let replacements = {};
 
-    const request = new sql.Request();
-    if (deviceUUID) request.input('deviceUUID', sql.VarChar, deviceUUID);
-    if (deviceId) request.input('deviceId', sql.Int, deviceId);
+    if (deviceUUID) {
+      query = 'SELECT pinRequired FROM Devices WHERE deviceUUID = :deviceUUID';
+      replacements = { deviceUUID };
+    } else if (deviceId) {
+      query = 'SELECT pinRequired FROM Devices WHERE id = :deviceId';
+      replacements = { deviceId };
+    } else {
+      return res.status(400).json({ success: false, error: 'deviceUUID or deviceId is required' });
+    }
 
-    const result = await request.query(query);
-    if (result.recordset.length === 0) {
+    const [result] = await sequelize.query(query, { replacements });
+
+    if (!result.length) {
       return res.status(404).json({ success: false, error: 'Device not found' });
     }
 
-    res.json({ success: true, pinRequired: result.recordset[0].pinRequired });
+    res.json({ success: true, pinRequired: result[0].pinRequired });
   } catch (err) {
-    console.error(err);
+    console.error('❌ /api/device/pin-required error:', err);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
+
+const { getTrainingFaces } = require('./face_employee');
+
+app.post('/api/face/training-data', async (req, res) => {
+  const { deviceUUID } = req.body;
+  if (!deviceUUID) {
+    return res.status(400).json({ success: false, message: 'Missing deviceUUID' });
+  }
+
+  try {
+    const result = await getTrainingFaces(deviceUUID);
+    res.json(result);
+  } catch (err) {
+    console.error('Error in /face/training-data:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+
+
+app.get("/api/face/embeddings", async (req, res) => {
+  const deviceUUID = (req.query.deviceUUID || "").trim().toLowerCase();
+  if (!deviceUUID) {
+    return res.status(400).json({ success: false, message: "Missing deviceUUID" });
+  }
+console.log("📡 Looking up deviceUUID:", deviceUUID);
+  try {
+      const [[device]] = await sequelize.query(`
+        SELECT companyId FROM Devices WHERE LOWER(deviceUUID) = :deviceUUID
+      `, { replacements: { deviceUUID } });
+    console.log("🔍 Device found:", device);
+
+    if (!device) {
+      return res.status(404).json({ success: false, message: "Device not found" });
+    }
+
+    const response = await axios.get("http://localhost:8000/api/face/embeddings", {
+      params: { companyId: device.companyId },
+    });
+
+    return res.json(response.data);
+  } catch (err) {
+    console.error("❌ Error fetching embeddings:", err);
+    return res.status(500).json({ success: false, message: "Failed to fetch embeddings" });
+  }
+});
+
 
 /**
  * Start server
